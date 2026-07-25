@@ -1,0 +1,2 @@
+# Downloaded source PDFs -- re-fetched fresh by the parser each run, not source code
+*.pdf
