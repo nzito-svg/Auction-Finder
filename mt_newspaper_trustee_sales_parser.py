@@ -214,6 +214,86 @@ def parse_hud_foreclosure_notice(text: str) -> dict:
     }
 
 
+MONTH_NUM = {
+    m: i for i, m in enumerate(
+        ["january","february","march","april","may","june","july",
+         "august","september","october","november","december"], start=1
+    )
+}
+
+
+def parse_sheriff_sale_notice(text: str) -> dict:
+    """
+    Third distinct legal template found in these newspapers: a judicial
+    execution sale ("NOTICE OF SHERIFF'S SALE" -- a lawsuit -> judgment ->
+    writ of execution, not a deed-of-trust default). Column tags these
+    under the same noticetype as ordinary trustee sales ("Trustee Sale"),
+    so they're already being fetched -- they just weren't being parsed,
+    which is what silently routed them all into the same collided/
+    overwritten row (see build_record's dedup fix).
+
+    Distinguishing structure: "<Plaintiff>,\\nPlaintiff,\\nv.\\n<Defendant
+    block>...commonly known as:\\n<address>,\\nDefendants." followed later
+    by a plain-language repeat: "Commonly known as <address>." and
+    "Notice is hereby given that on <Month Day> at <time> ... the above-
+    described property will be sold...", with the notice's own filing
+    date given separately as "Date: <Month Day>, <year>" -- the sale's
+    own year isn't stated next to the sale date, so it's inferred from
+    the filing date (same year if the sale month is >= the filing month,
+    else the following year, since these are always noticed forward).
+    """
+    plaintiff_match = re.search(r"\n([A-Z][^\n]+?),\s*\nPlaintiff", text)
+    defendant_match = re.search(
+        r"\nv\.\s*\n(.+?)(?:\s+the real property commonly known as|\nDefendants\.)", text, re.DOTALL
+    )
+    address_match = re.search(r"Commonly known as\s+([^.\n]+)\.", text, re.IGNORECASE)
+    case_match = re.search(r"Case No\.?:?\s*([A-Za-z0-9\-]+)", text)
+    sale_match = re.search(
+        r"on\s+([A-Za-z]+\s+\d{1,2})(?:st|nd|rd|th)?\s+at\s+(\d{1,2}:\d{2}\s*[ap]\.?m\.?)", text, re.IGNORECASE
+    )
+    filing_date_match = re.search(r"Date:\s*([A-Za-z]+)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+(\d{4})", text)
+    sheriff_match = re.search(r"\nBy:\s*([A-Z][A-Za-z.,'\- ]+)", text)
+    # Bounded to stop at a zip code -- otherwise the address-like phrase
+    # runs straight into the following sentence ("...the above-described
+    # property will be sold...") since that text has no commas to stop at.
+    location_match = re.search(
+        r"on the [^,]*?steps of the ([^,\n]+Courthouse[^,\n]*(?:,\s*[^,\n]+){0,2}?\d{5})", text, re.IGNORECASE
+    )
+
+    sale_date_raw = None
+    if sale_match and filing_date_match:
+        month_name, day = sale_match.group(1).rsplit(" ", 1)
+        sale_month = MONTH_NUM.get(month_name.strip().lower())
+        filing_month = MONTH_NUM.get(filing_date_match.group(1).strip().lower())
+        filing_year = int(filing_date_match.group(2))
+        if sale_month and filing_month:
+            year = filing_year if sale_month >= filing_month else filing_year + 1
+            sale_date_raw = f"{month_name.strip()} {day}, {year}"
+
+    defendant = None
+    if defendant_match:
+        defendant = re.sub(r"\s+", " ", defendant_match.group(1)).strip().rstrip(";,")
+        # Standard boilerplate tacked onto every defendant list, naming the
+        # property rather than a real party -- strip it if present so
+        # borrower_name reflects only the actual named defendant(s).
+        defendant = re.sub(
+            r";?\s*and\s+Unknown Parties in possession of or with an interest in\s*$",
+            "", defendant, flags=re.IGNORECASE,
+        ).strip()
+
+    return {
+        "borrower_name": defendant,
+        "trustee_name": sheriff_match.group(1).strip() if sheriff_match else None,
+        "lender_name": plaintiff_match.group(1).strip() if plaintiff_match else None,
+        "property_address": address_match.group(1).strip() if address_match else None,
+        "sale_date_raw": sale_date_raw,
+        "sale_time": sale_match.group(2).upper().replace(".", "") if sale_match else None,
+        "sale_location": location_match.group(1).strip() if location_match else None,
+        "total_amount_owed": None,
+        "case_number": case_match.group(1) if case_match else None,
+    }
+
+
 def parse_trustee_sale_notice(text: str) -> dict:
     """Parses the standard non-judicial 'NOTICE OF TRUSTEE'S SALE' template."""
     # Grantor names routinely contain periods (middle initials, "Jr."), so
@@ -233,8 +313,12 @@ def parse_trustee_sale_notice(text: str) -> dict:
     beneficiary_match = re.search(
         r"obligation owed to ([^,]+?)(?:,\s+as designated nominee for ([^,]+?))?,\s+Beneficiary", text
     )
+    # Bounded length rather than excluding newlines outright -- an address
+    # occasionally wraps mid-line right at the state/zip ("MT\n59714"), and
+    # excluding \n entirely made the whole match fail whenever that happened.
+    # Any embedded newline gets collapsed to a space where this is used below.
     address_match = re.search(
-        r"(?:more commonly known as|common address:?)\s*([^.\n]+?)\.", text, re.IGNORECASE
+        r"(?:more commonly known as|common address:?)\s*([^.]{1,100}?)\.", text, re.IGNORECASE
     )
     sale_match = re.search(
         r"Trustee.?s Sale on ([A-Za-z]+ \d{1,2},?\s*\d{4}),?\s+at\s+(\d{1,2}:\d{2}\s*[AP]M)", text
@@ -250,8 +334,17 @@ def parse_trustee_sale_notice(text: str) -> dict:
         lender = beneficiary_match.group(2) or beneficiary_match.group(1)
 
     if not grantor_match and not address_match:
-        # Doesn't match the standard trustee-sale template at all -- try the
-        # HUD/FHA foreclosure-commissioner template before giving up.
+        # Doesn't match the standard trustee-sale template. Route by an
+        # explicit template signal rather than "try one, see if anything
+        # matched" -- the HUD template's "commonly known as" address regex
+        # is generic enough to also match a Sheriff's Sale notice's own
+        # "commonly known as" phrasing, which previously caused every
+        # Sheriff's Sale to get silently mislabeled as a HUD sale (with a
+        # hardcoded HUD lender_name) since HUD was tried first.
+        if re.search(r"sheriff'?s sale|writ of execution", text, re.IGNORECASE):
+            sheriff_parsed = parse_sheriff_sale_notice(text)
+            if sheriff_parsed["borrower_name"] or sheriff_parsed["property_address"]:
+                return sheriff_parsed
         hud_parsed = parse_hud_foreclosure_notice(text)
         if hud_parsed["borrower_name"] or hud_parsed["property_address"]:
             return hud_parsed
@@ -260,7 +353,7 @@ def parse_trustee_sale_notice(text: str) -> dict:
         "borrower_name": grantor_match.group(1).strip() if grantor_match else None,
         "trustee_name": trustee_match.group(1).strip() if trustee_match else None,
         "lender_name": lender.strip() if lender else None,
-        "property_address": address_match.group(1).strip() if address_match else None,
+        "property_address": re.sub(r"\s+", " ", address_match.group(1)).strip() if address_match else None,
         "sale_date_raw": sale_match.group(1) if sale_match else None,
         "sale_time": sale_match.group(2) if sale_match else None,
         "sale_location": location_match.group(1).strip() if location_match else None,
@@ -284,9 +377,29 @@ def build_record(hit: dict, cfg: dict) -> dict:
     file_number = extract_file_number(raw)
     parsed = parse_trustee_sale_notice(raw)
 
-    dedup_source = file_number or hashlib.sha1(
-        f"{parsed.get('borrower_name')}|{parsed.get('property_address')}|{parsed.get('sale_date_raw')}".encode()
-    ).hexdigest()[:16]
+    if file_number:
+        dedup_source = file_number
+    elif parsed.get("case_number"):
+        # Sheriff's Sale notices don't have the trustee-firm "File No." that
+        # extract_file_number looks for, but a court case number is just as
+        # stable a dedup key across the notice's 3 weekly republications.
+        dedup_source = parsed["case_number"]
+    elif parsed.get("borrower_name") or parsed.get("property_address") or parsed.get("sale_date_raw"):
+        dedup_source = hashlib.sha1(
+            f"{parsed.get('borrower_name')}|{parsed.get('property_address')}|{parsed.get('sale_date_raw')}".encode()
+        ).hexdigest()[:16]
+    else:
+        # Total parse failure (an unrecognized notice template): the three
+        # fields above are all None, which would hash identically for EVERY
+        # such notice -- silently colliding unrelated sales into one row
+        # that just gets overwritten each ingestion run. Hash the raw text
+        # instead so distinct notices don't clobber each other. Tradeoff:
+        # weekly republications of the same unparsed notice (MT law requires
+        # 3 consecutive weeks) may dedupe less precisely than the
+        # structured-field path above, since re-fetched text isn't always
+        # byte-identical -- duplicate rows here are a much smaller problem
+        # than silently losing sales.
+        dedup_source = hashlib.sha1(raw.encode()).hexdigest()[:16]
 
     is_commercial, keyword = classify_borrower(parsed.get("borrower_name"))
 
@@ -310,6 +423,7 @@ def build_record(hit: dict, cfg: dict) -> dict:
         "sale_location": parsed.get("sale_location"),
         "principal_balance": None,
         "original_loan_amount": None,
+        "case_number": parsed.get("case_number"),
         "raw_text": raw[:20000],
         "source_url": hit.get("pdfurl") or None,
         "published_at": None,
