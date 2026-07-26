@@ -22,9 +22,19 @@ loaded, but the request it makes was found by pulling that JS chunk (see
 module "M9RC" in the vendor bundle) -- it POSTs to
 {backend}/search/public-notices with a flat JSON body (NOT wrapped in a
 "data" key at the HTTP layer -- that wrapping happens inside the JS before
-the fetch call). Needs an Origin/Referer header matching the paper's
-column.us subdomain or the filters are silently ignored and it falls back
-to returning an unfiltered global result set.
+the fetch call). Needs an Origin/Referer header from *some* column.us
+subdomain or the filters are silently ignored and it falls back to
+returning an unfiltered global result set -- but which subdomain doesn't
+matter, it isn't tied to the `newspapername` filter in the body at all
+(confirmed: querying with Origin=mtstandard.column.us but
+newspapername=["Daily Inter Lake"] returns correct Daily Inter Lake
+results). So every county below reuses COLUMN_SUBDOMAIN rather than each
+needing its own -- one less thing to discover per newspaper added.
+The full list of Montana newspapers on this backend (57 papers as of this
+writing) is queryable directly:
+  POST {API_BASE}/search/public-notices/facets
+  body: {"search":"","facets":{"newspapername":{"type":"value","size":250,"name":"string"}},"allFilters":[{"state":["Montana"]}],"noneFilters":[]}
+-- worth re-running that if covering yet another county down the road.
 
 NOTICE TYPES:
 Column tags these under noticetype "Notice of Trustee's Sale", "Trustee
@@ -70,6 +80,11 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "PASTE_YOUR_SUPABASE_SERVI
 API_BASE = "https://us-central1-enotice-production.cloudfunctions.net/api"
 NOTICE_TYPES = ["Notice of Trustee's Sale", "Trustee Sale", "Foreclosure Sale"]
 
+# Any live column.us subdomain works as the Origin/Referer for every county
+# below -- see the docstring above. Kept as its own constant so it's obvious
+# this isn't tied to any particular paper.
+COLUMN_SUBDOMAIN = "missoulian"
+
 COUNTIES = {
     "gallatin": {
         "county": "Gallatin",
@@ -82,6 +97,36 @@ COUNTIES = {
         "newspaper": "Missoulian",
         "column_subdomain": "missoulian",
         "source": "missoulian_column",
+    },
+    "flathead": {
+        "county": "Flathead",
+        "newspaper": "Daily Inter Lake",
+        "column_subdomain": COLUMN_SUBDOMAIN,
+        "source": "dailyinterlake_column",
+    },
+    "cascade": {
+        "county": "Cascade",
+        "newspaper": "Great Falls Tribune",
+        "column_subdomain": COLUMN_SUBDOMAIN,
+        "source": "greatfallstribune_column",
+    },
+    "silverbow": {
+        "county": "Silver Bow",
+        "newspaper": "Montana Standard",
+        "column_subdomain": "mtstandard",
+        "source": "mtstandard_column",
+    },
+    "custer": {
+        "county": "Custer",
+        "newspaper": "Miles City Star",
+        "column_subdomain": COLUMN_SUBDOMAIN,
+        "source": "milescitystar_column",
+    },
+    "dawson": {
+        "county": "Dawson",
+        "newspaper": "Glendive Ranger Review",
+        "column_subdomain": COLUMN_SUBDOMAIN,
+        "source": "glendiverangerreview_column",
     },
 }
 
@@ -305,6 +350,16 @@ def parse_trustee_sale_notice(text: str) -> dict:
     grantor_match = re.search(
         r"\n([A-Z][^\n]{0,150}?),?\s+as Grantors?\(?s?\)?,?\s+conveyed", text
     )
+    # When "More commonly known as <address>." shares a paragraph with the
+    # grantor sentence (no blank line between them -- only between the legal
+    # description and "More commonly known as"), the newline-anchored match
+    # above latches onto the address sentence instead, since it only
+    # excludes newlines, not periods -- e.g. "More commonly known as 108
+    # Hearst Dr, Kalispell, MT 59901. Samantha Johnson and Aaron Allen, as
+    # Grantors, conveyed...". A real name never contains a digit, so that's
+    # a reliable tell this happened -- discard and fall through.
+    if grantor_match and any(c.isdigit() for c in grantor_match.group(1)):
+        grantor_match = None
     if not grantor_match:
         grantor_match = re.search(
             r"([A-Z][^.\n]{0,120}?),?\s+as Grantors?\(?s?\)?,?\s+conveyed", text
@@ -401,7 +456,7 @@ def build_record(hit: dict, cfg: dict) -> dict:
         # than silently losing sales.
         dedup_source = hashlib.sha1(raw.encode()).hexdigest()[:16]
 
-    is_commercial, keyword = classify_borrower(parsed.get("borrower_name"))
+    is_commercial_by_name, keyword = classify_borrower(parsed.get("borrower_name"))
 
     return {
         "id": f"{cfg['source']}-{dedup_source}",
@@ -411,7 +466,17 @@ def build_record(hit: dict, cfg: dict) -> dict:
         "county": cfg["county"],
         "notice_type": hit.get("noticetype"),
         "borrower_name": parsed.get("borrower_name"),
-        "is_commercial": is_commercial,
+        # NOTE: the overall `is_commercial` field is deliberately NOT set
+        # here -- see the merge step in main() right before upsert. This
+        # script only knows the name-based signal; parcel-type and
+        # web-search commercial checks run separately (enrich_with_parcel_data.py,
+        # and a manual/agent web-search pass) and can correct false
+        # positives/negatives from this one. If this dict blindly set
+        # `is_commercial` = is_commercial_by_name on every run, re-ingesting
+        # an already-corrected row (which happens routinely -- the fetch
+        # window overlaps previously-seen notices) would silently revert
+        # any correction made after the fact.
+        "is_commercial_by_name": is_commercial_by_name,
         "commercial_match_keyword": keyword,
         "trustee_name": parsed.get("trustee_name"),
         "lender_name": parsed.get("lender_name"),
@@ -440,13 +505,25 @@ def upsert_table(table: str, records: list) -> None:
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates",
     }
-    for i in range(0, len(records), 500):
-        batch = records[i : i + 500]
-        resp = requests.post(url, headers=headers, json=batch, timeout=60)
-        if resp.status_code not in (200, 201):
-            print(f"  ! Upsert to {table} failed: {resp.status_code} {resp.text[:300]}")
-        else:
-            print(f"  ✓ Upserted {len(batch)} rows into {table}")
+    # PostgREST rejects a batch outright ("All object keys must match", 400)
+    # if the objects in it don't all have identical keys -- which happens
+    # here on essentially every normal run, since new records (with
+    # is_commercial/is_commercial_by_name) and pre-existing ones (without,
+    # deliberately -- see main()) get mixed together. Group by exact key
+    # set first so each POST is internally uniform; a single heterogeneous
+    # batch would otherwise fail ALL of it, new rows included.
+    groups = {}
+    for r in records:
+        groups.setdefault(frozenset(r.keys()), []).append(r)
+
+    for key_set, group in groups.items():
+        for i in range(0, len(group), 500):
+            batch = group[i : i + 500]
+            resp = requests.post(url, headers=headers, json=batch, timeout=60)
+            if resp.status_code not in (200, 201):
+                print(f"  ! Upsert to {table} failed: {resp.status_code} {resp.text[:300]}")
+            else:
+                print(f"  ✓ Upserted {len(batch)} rows into {table}")
 
 
 def main():
@@ -474,22 +551,57 @@ def main():
         by_id[record["id"]] = record
     records = list(by_id.values())
 
-    commercial = [r for r in records if r["is_commercial"]]
+    commercial = [r for r in records if r["is_commercial_by_name"]]
     print(
         f"\nDeduped to {len(records)} unique notices -- "
-        f"{len(commercial)} flagged commercial, {len(records) - len(commercial)} residential/unclassified"
+        f"{len(commercial)} flagged commercial by name, {len(records) - len(commercial)} residential/unclassified"
     )
 
     if args.dry_run:
         print("\n--dry-run set, not writing to Supabase.")
         for r in records:
-            flag = "COMMERCIAL" if r["is_commercial"] else "residential"
+            flag = "COMMERCIAL" if r["is_commercial_by_name"] else "residential"
             print(f"  [{flag:10s}] {r['borrower_name']!r:40s} {r['property_address']} ({r['notice_type']})")
         return
 
     if "PASTE_YOUR" in SUPABASE_URL or "PASTE_YOUR" in SUPABASE_KEY:
         print("\nMissing Supabase credentials -- set SUPABASE_URL and SUPABASE_SERVICE_KEY.")
         sys.exit(1)
+
+    # Find which of these ids already exist -- re-fetching the same
+    # published notice is routine (the lookback window overlaps previously-
+    # seen weeks), and re-deriving is_commercial_by_name from the SAME
+    # unchanged borrower_name text produces the SAME value every time. That
+    # makes it look safe to just re-include it in the upsert, but it isn't:
+    # if a human (or the web-search enrichment pass) later corrected
+    # is_commercial for that row precisely because the name-based signal
+    # was wrong (e.g. a co-defendant name tripping the keyword match), a
+    # blind re-include silently reverts that correction on every subsequent
+    # run within the lookback window. So for rows that already exist, the
+    # commercial fields are left out of the payload entirely -- upsert's
+    # merge-duplicates only touches columns actually present, so omitted
+    # columns keep whatever value (corrected or not) is already there. Only
+    # genuinely new rows get is_commercial_by_name/is_commercial computed
+    # fresh here.
+    ids = [r["id"] for r in records]
+    existing_ids = set()
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    for i in range(0, len(ids), 200):
+        batch_ids = ids[i : i + 200]
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/trustee_sales",
+            headers=headers,
+            params={"select": "id", "id": f"in.({','.join(batch_ids)})"},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            existing_ids.update(row["id"] for row in resp.json())
+
+    for r in records:
+        if r["id"] in existing_ids:
+            del r["is_commercial_by_name"]
+        else:
+            r["is_commercial"] = r["is_commercial_by_name"]
 
     upsert_table("trustee_sales", records)
 
