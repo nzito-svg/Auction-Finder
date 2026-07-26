@@ -48,7 +48,9 @@ def fetch_rows() -> list:
     resp = requests.get(
         f"{SUPABASE_URL}/rest/v1/trustee_sales",
         headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
-        params={"select": SELECT_FIELDS, "order": "sale_date.asc.nullslast"},
+        # is_expired=false: archived (sale date passed) listings stay in the
+        # database for reference but are left out of the dashboard entirely.
+        params={"select": SELECT_FIELDS, "order": "sale_date.asc.nullslast", "is_expired": "eq.false"},
         timeout=30,
     )
     resp.raise_for_status()
